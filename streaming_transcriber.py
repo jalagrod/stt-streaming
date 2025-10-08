@@ -123,6 +123,7 @@ class StreamingTranscriber:
             sample_rate=self.sample_rate,
             interim_results=True,
             enable_diarization=True,
+            endpointing_ms=Config.DEEPGRAM_ENDPOINTING_MS,
             api_key=Config.DEEPGRAM_API_KEY,
             http_session=self._http_session,
         )

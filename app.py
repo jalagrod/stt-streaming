@@ -197,6 +197,6 @@ if __name__ == "__main__":
         print("Iniciando aplicacion Gradio...")
         Config.validar_configuracion("deepgram")
         interfaz = crear_interfaz()
-        interfaz.launch(server_name="127.0.0.1", server_port=8080, share=False)
+        interfaz.launch(server_name=Config.HOST, server_port=Config.PORT, share=False)
     except Exception as exc:
         print(f"Error al iniciar la aplicacion: {exc}")

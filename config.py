@@ -10,6 +10,7 @@ class Config:
 
     # Deepgram credentials
     DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+    DEEPGRAM_ENDPOINTING_MS = int(os.getenv("DEEPGRAM_ENDPOINTING_MS", "25"))
 
     # Optional LiveKit values (kept for compatibility with livekit_agent.py)
     LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://localhost:7880")
@@ -19,6 +20,10 @@ class Config:
     # Audio parameters
     SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", "16000"))
     CHANNELS = int(os.getenv("CHANNELS", "1"))
+
+    # App parameters
+    HOST = os.getenv("HOST", "127.0.0.1")
+    PORT = int(os.getenv("PORT", "8080"))
 
     @classmethod
     def validar_configuracion(cls, proveedor: str = "deepgram") -> bool:

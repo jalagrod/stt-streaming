@@ -2,30 +2,29 @@ import asyncio
 import contextlib
 import time
 from dataclasses import dataclass
-from typing import AsyncGenerator, Optional, Tuple
+from typing import AsyncGenerator, Dict, List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 import sounddevice as sd
-
 from livekit import rtc
 from livekit.agents.stt import SpeechEvent, SpeechEventType, SpeechStream
 from livekit.plugins import deepgram
-
-import aiohttp
 
 from config import Config
 
 
 @dataclass
 class TranscriptionUpdate:
-    """Small container used to stream updates back to the UI."""
+    """Payload returned to the UI with every STT event."""
 
     text: str
     info: str
+    conversation: List[Dict[str, str]]
 
 
 class StreamingTranscriber:
-    """Manage local microphone capture and Deepgram streaming STT."""
+    """Capture microphone audio and stream it to Deepgram with multi-speaker support."""
 
     MODEL_CODE = "deepgram/nova-3:multi"
 
@@ -57,21 +56,29 @@ class StreamingTranscriber:
         self._last_status = "idle"
         self._error_message: Optional[str] = None
 
-        self._interim_text = ""
-        self._final_text = ""
+        self._conversation: List[Dict[str, str]] = []
+        self._interim_by_speaker: Dict[str, str] = {}
+        self._speaker_alias: Dict[str, str] = {}
+        self._next_speaker_index = 1
 
+    # ------------------------------------------------------------------ #
+    # Properties
+    # ------------------------------------------------------------------ #
     @property
     def is_running(self) -> bool:
         return self._input_stream is not None and not self._stop_requested
 
     @property
     def current_text(self) -> str:
-        interim = self._interim_text.strip()
-        final = self._final_text.strip()
-        if interim:
-            return f"{final} {interim}".strip()
-        return final
+        return self._build_display_text()
 
+    @property
+    def conversation(self) -> List[Dict[str, str]]:
+        return [segment.copy() for segment in self._conversation]
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle management
+    # ------------------------------------------------------------------ #
     def status_message(self, headline: str) -> str:
         error = f"\nError: {self._error_message}" if self._error_message else ""
         status = (
@@ -79,7 +86,8 @@ class StreamingTranscriber:
             f"Modelo: {self.MODEL_CODE}\n"
             f"Audio enviado: {self._audio_seconds:.2f}s "
             f"(Deepgram reporta {self._usage_seconds:.2f}s)\n"
-            f"Fragmentos descartados: {self._dropped_chunks}"
+            f"Fragmentos descartados: {self._dropped_chunks}\n"
+            f"Segmentos finales: {len(self._conversation)}"
         )
         status += f"\nUltimo evento: {self._last_status}{error}"
         return status
@@ -90,8 +98,7 @@ class StreamingTranscriber:
 
         Config.validar_configuracion("deepgram")
 
-        loop = asyncio.get_running_loop()
-        self._loop = loop
+        self._loop = asyncio.get_running_loop()
         self._audio_queue = asyncio.Queue(maxsize=50)
         self._stop_requested = False
         self._input_closed = False
@@ -100,8 +107,10 @@ class StreamingTranscriber:
         self._usage_seconds = 0.0
         self._dropped_chunks = 0
         self._error_message = None
-        self._interim_text = ""
-        self._final_text = ""
+        self._conversation.clear()
+        self._interim_by_speaker.clear()
+        self._speaker_alias.clear()
+        self._next_speaker_index = 1
         self._last_status = "esperando audio"
 
         if self._http_session is not None and not self._http_session.closed:
@@ -113,6 +122,7 @@ class StreamingTranscriber:
             language="multi",
             sample_rate=self.sample_rate,
             interim_results=True,
+            enable_diarization=True,
             api_key=Config.DEEPGRAM_API_KEY,
             http_session=self._http_session,
         )
@@ -170,6 +180,9 @@ class StreamingTranscriber:
         self._audio_queue = None
         self._loop = None
 
+    # ------------------------------------------------------------------ #
+    # Streaming helpers
+    # ------------------------------------------------------------------ #
     async def iter_transcripts(self) -> AsyncGenerator[TranscriptionUpdate, None]:
         if self._speech_stream is None:
             raise RuntimeError("el stream aun no ha sido iniciado")
@@ -182,62 +195,62 @@ class StreamingTranscriber:
         self._last_status = "stream cerrado"
 
     def _handle_event(self, event: SpeechEvent) -> Optional[TranscriptionUpdate]:
+        if not event.alternatives:
+            return None
+
+        text = (event.alternatives[0].text or "").strip()
+        speaker_id = self._extract_speaker(event)
+
         if event.type == SpeechEventType.INTERIM_TRANSCRIPT:
-            text = (event.alternatives[0].text or "").strip()
-            self._interim_text = text
+            if text and speaker_id is not None:
+                self._interim_by_speaker[speaker_id] = text
             self._last_status = "transcripcion parcial"
-            return TranscriptionUpdate(
-                text=self.current_text,
-                info=self.status_message("Transcripcion parcial"),
-            )
+            return self._make_update("Transcripcion parcial")
+
+        if event.type == SpeechEventType.PREFLIGHT_TRANSCRIPT:
+            if text and speaker_id is not None:
+                self._interim_by_speaker[speaker_id] = text
+            self._last_status = "transcripcion estable"
+            return self._make_update("Transcripcion estable")
 
         if event.type == SpeechEventType.FINAL_TRANSCRIPT:
-            text = (event.alternatives[0].text or "").strip()
+            if speaker_id is not None:
+                self._interim_by_speaker.pop(speaker_id, None)
             if text:
-                if self._final_text:
-                    self._final_text += " "
-                self._final_text += text
-            self._interim_text = ""
+                alias = self._alias_for_speaker(speaker_id)
+                self._conversation.append(
+                    {
+                        "speaker": alias,
+                        "text": text,
+                        "timestamp": time.strftime("%H:%M:%S"),
+                    }
+                )
             self._last_status = "transcripcion final"
-            return TranscriptionUpdate(
-                text=self.current_text,
-                info=self.status_message("Transcripcion final"),
-            )
+            return self._make_update("Transcripcion final")
 
         if event.type == SpeechEventType.START_OF_SPEECH:
             self._last_status = "inicio de habla"
-            return TranscriptionUpdate(
-                text=self.current_text,
-                info=self.status_message("Habla detectada"),
-            )
+            return self._make_update("Habla detectada")
 
         if event.type == SpeechEventType.END_OF_SPEECH:
             self._last_status = "fin de habla"
-            return TranscriptionUpdate(
-                text=self.current_text,
-                info=self.status_message("Silencio detectado"),
-            )
-
-        if event.type == SpeechEventType.PREFLIGHT_TRANSCRIPT:
-            text = (event.alternatives[0].text or "").strip()
-            self._interim_text = text
-            self._last_status = "transcripcion estable"
-            return TranscriptionUpdate(
-                text=self.current_text,
-                info=self.status_message("Transcripcion estable"),
-            )
+            return self._make_update("Silencio detectado")
 
         if event.type == SpeechEventType.RECOGNITION_USAGE and event.recognition_usage:
             self._usage_seconds = max(
                 self._usage_seconds, float(event.recognition_usage.audio_duration)
             )
             self._last_status = "metricas actualizadas"
-            return TranscriptionUpdate(
-                text=self.current_text,
-                info=self.status_message("Metricas de Deepgram"),
-            )
+            return self._make_update("Metricas de Deepgram")
 
         return None
+
+    def _make_update(self, headline: str) -> TranscriptionUpdate:
+        return TranscriptionUpdate(
+            text=self._build_display_text(),
+            info=self.status_message(headline),
+            conversation=self.conversation,
+        )
 
     async def _consume_audio_queue(self) -> None:
         if self._audio_queue is None or self._speech_stream is None:
@@ -294,7 +307,34 @@ class StreamingTranscriber:
         self._speech_stream = None
         self._stt = None
         self._audio_queue = None
-        if self._session is not None:
+        if self._http_session is not None:
             with contextlib.suppress(Exception):
-                await self._session.aclose()
-        self._session = None
+                await self._http_session.close()
+        self._http_session = None
+
+    def _extract_speaker(self, event: SpeechEvent) -> Optional[str]:
+        speaker_id = event.alternatives[0].speaker_id if event.alternatives else None
+        if speaker_id is None:
+            return "__unknown__"
+        return str(speaker_id)
+
+    def _alias_for_speaker(self, speaker_id: Optional[str]) -> str:
+        if not speaker_id or speaker_id == "__unknown__":
+            return "Orador"
+        alias = self._speaker_alias.get(speaker_id)
+        if alias is None:
+            alias = f"Orador {self._next_speaker_index}"
+            self._next_speaker_index += 1
+            self._speaker_alias[speaker_id] = alias
+        return alias
+
+    def _build_display_text(self) -> str:
+        lines: List[str] = []
+        for segment in self._conversation:
+            lines.append(f"{segment['timestamp']} - {segment['speaker']}: {segment['text']}")
+
+        for speaker_id, text in self._interim_by_speaker.items():
+            alias = self._alias_for_speaker(speaker_id)
+            lines.append(f"{time.strftime('%H:%M:%S')} - {alias} (parcial): {text}")
+
+        return "\n".join(lines)

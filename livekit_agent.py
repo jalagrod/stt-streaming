@@ -26,13 +26,6 @@ class TranscriptionAgent:
                 model="nova-2",
                 language=self.idioma
             )
-        elif self.proveedor == "azure":
-            # Azure Speech Services
-            return azure.STT(
-                speech_key=Config.AZURE_SPEECH_KEY,
-                speech_region=Config.AZURE_SPEECH_REGION,
-                language=self.idioma
-            )
         else:
             raise ValueError(f"Proveedor no soportado: {self.proveedor}")
     

@@ -1,148 +1,161 @@
 import gradio as gr
-import asyncio
+
 from config import Config
+from streaming_transcriber import StreamingTranscriber
 
-def formatear_tiempo(segundos):
-    """Formatea segundos a formato legible"""
-    if segundos < 60:
-        return f"{segundos:.2f}s"
-    minutos = int(segundos // 60)
-    segs = segundos % 60
-    return f"{minutos}m {segs:.1f}s"
 
-async def transcribir_audio_async(audio_input, proveedor_nombre, idioma_nombre):
-    """Función asíncrona de transcripción"""
-    if audio_input is None:
-        return "", "Error: No se ha proporcionado ningún audio"
-    
-    # Obtener códigos
-    proveedor = Config.PROVEEDORES.get(proveedor_nombre, "deepgram")
-    idioma = Config.IDIOMAS.get(idioma_nombre, "es")
-    
-    try:
-        # Crear tester
-        tester = LocalAudioTester(proveedor=proveedor, idioma=idioma)
-        
-        # Transcribir
-        transcripciones = await tester.transcribir_archivo(audio_input)
-        
-        # Formatear resultado
-        texto_final = " ".join(transcripciones)
-        
-        info = f"""
-Transcripción completada
-
-Proveedor: {proveedor_nombre}
-Idioma: {idioma_nombre} ({idioma})
-Palabras: {len(texto_final.split())}
-        """
-        
-        return texto_final, info
-        
-    except Exception as e:
-        return "", f"Error: {str(e)}"
-
-def transcribir_audio(audio_input, proveedor, idioma):
-    """Wrapper síncrono para Gradio"""
-    return asyncio.run(transcribir_audio_async(audio_input, proveedor, idioma))
-
-def crear_interfaz():
-    """Crea la interfaz de Gradio"""
-    
-    with gr.Blocks(theme=gr.themes.Soft(), title="LiveKit STT Transcriptor") as app:
-        
-        gr.Markdown("""
-        # Transcriptor de Audio con LiveKit STT
-        
-        Transcribe audio en tiempo real usando plugins de LiveKit.
-        Soporta Deepgram y Azure Speech Services.
-        """)
-        
-        with gr.Row():
-            with gr.Column(scale=1):
-                gr.Markdown("### Entrada de Audio")
-                
-                audio_input = gr.Audio(
-                    sources=["microphone", "upload"],
-                    type="filepath",
-                    label="Graba o sube un archivo de audio"
-                )
-                
-                proveedor = gr.Dropdown(
-                    choices=list(Config.PROVEEDORES.keys()),
-                    value="Deepgram",
-                    label="Proveedor STT"
-                )
-                
-                idioma = gr.Dropdown(
-                    choices=list(Config.IDIOMAS.keys()),
-                    value="Español",
-                    label="Idioma"
-                )
-                
-                transcribir_btn = gr.Button("Transcribir", variant="primary", size="lg")
-                
-                gr.Markdown("""
-                ### Requisitos
-                - Deepgram: Necesitas DEEPGRAM_API_KEY en .env
-                - Azure: Necesitas AZURE_SPEECH_KEY y AZURE_SPEECH_REGION
-                
-                ### Consejos
-                - Habla claramente
-                - Evita ruido de fondo
-                - Deepgram es mejor para tiempo real
-                """)
-            
-            with gr.Column(scale=2):
-                gr.Markdown("### Resultado")
-                
-                transcripcion_output = gr.Textbox(
-                    label="Transcripción",
-                    placeholder="La transcripción aparecerá aquí...",
-                    lines=15
-                )
-                
-                info_output = gr.Textbox(
-                    label="Información",
-                    lines=5
-                )
-        
-        transcribir_btn.click(
-            fn=transcribir_audio,
-            inputs=[audio_input, proveedor, idioma],
-            outputs=[transcripcion_output, info_output]
+async def start_streaming(
+    state: StreamingTranscriber | None,
+) -> tuple[str, str, StreamingTranscriber | None, dict, dict]:
+    """Start a Deepgram streaming session and yield UI updates."""
+    if isinstance(state, StreamingTranscriber) and state.is_running:
+        yield (
+            state.current_text,
+            state.status_message("Streaming ya estaba activo"),
+            state,
+            gr.update(interactive=False),
+            gr.update(interactive=True),
         )
-        
-        gr.Markdown("""
-        ---
-        Powered by LiveKit Agents Framework
-        """)
-    
+        return
+
+    transcriber = StreamingTranscriber()
+
+    try:
+        await transcriber.start()
+    except Exception as exc:
+        previous_text = state.current_text if isinstance(state, StreamingTranscriber) else ""
+        yield (
+            previous_text,
+            f"Error al iniciar el streaming: {exc}",
+            state if isinstance(state, StreamingTranscriber) else None,
+            gr.update(interactive=True),
+            gr.update(interactive=False),
+        )
+        return
+
+    yield (
+        transcriber.current_text,
+        transcriber.status_message("Streaming iniciado"),
+        transcriber,
+        gr.update(interactive=False),
+        gr.update(interactive=True),
+    )
+
+    try:
+        async for update in transcriber.iter_transcripts():
+            yield (
+                update.text,
+                update.info,
+                transcriber,
+                gr.update(interactive=False),
+                gr.update(interactive=True),
+            )
+    except Exception as exc:
+        await transcriber.aclose()
+        yield (
+            transcriber.current_text,
+            f"Error durante la transcripcion: {exc}",
+            None,
+            gr.update(interactive=True),
+            gr.update(interactive=False),
+        )
+        return
+
+    await transcriber.aclose()
+    yield (
+        transcriber.current_text,
+        transcriber.status_message("Streaming detenido"),
+        None,
+        gr.update(interactive=True),
+        gr.update(interactive=False),
+    )
+
+
+async def stop_streaming(
+    state: StreamingTranscriber | None,
+) -> tuple[str, str, StreamingTranscriber | None, dict, dict]:
+    """Request a graceful stop for the current streaming session."""
+    if not isinstance(state, StreamingTranscriber):
+        return (
+            "",
+            "No hay streaming activo.",
+            None,
+            gr.update(interactive=True),
+            gr.update(interactive=False),
+        )
+
+    await state.stop()
+    return (
+        state.current_text,
+        state.status_message("Deteniendo streaming..."),
+        state,
+        gr.update(interactive=False),
+        gr.update(interactive=False),
+    )
+
+
+def crear_interfaz() -> gr.Blocks:
+    """Build the Gradio UI for streaming STT."""
+    with gr.Blocks(theme=gr.themes.Soft(), title="Deepgram Streaming STT") as app:
+        gr.Markdown(
+            """
+            ## Streaming STT con Deepgram nova-3:multi
+
+            Esta demo captura el microfono local y envia audio a Deepgram usando
+            LiveKit Agents. Necesitas definir `DEEPGRAM_API_KEY` en `.env`.
+            """
+        )
+
+        state_holder = gr.State(None)
+
+        transcription_output = gr.Textbox(
+            label="Transcripcion",
+            placeholder="El texto aparecera aqui en cuanto hables...",
+            lines=14,
+            autofocus=True,
+        )
+        status_output = gr.Textbox(
+            label="Estado",
+            value="Presiona Iniciar para comenzar a escuchar el microfono local.",
+            lines=6,
+        )
+
+        with gr.Row():
+            start_button = gr.Button("Iniciar streaming", variant="primary")
+            stop_button = gr.Button("Detener", variant="secondary", interactive=False)
+
+        start_button.click(
+            fn=start_streaming,
+            inputs=[state_holder],
+            outputs=[transcription_output, status_output, state_holder, start_button, stop_button],
+            stream_every=0.1,        # opcional; controla cada cuánto se refrescan los yields
+            show_progress=False,
+        )
+
+        stop_button.click(
+            fn=stop_streaming,
+            inputs=[state_holder],
+            outputs=[transcription_output, status_output, state_holder, start_button, stop_button],
+            show_progress=False,
+        )
+
+        gr.Markdown(
+            """
+            ### Notas rapidas
+            - Se usa `StreamingTranscriber` con `AgentSession` configurado como `deepgram/nova-3:multi`.
+            - El audio se captura a 16 kHz mono para reducir latencia.
+            - Asegurate de cerrar la sesion antes de iniciar otra para evitar conflictos.
+            """
+        )
+
     return app
+
 
 if __name__ == "__main__":
     try:
-        print("Iniciando aplicación Gradio...")
-        print("Validando configuración...")
-        
-        # Intentar validar al menos un proveedor
-        tiene_deepgram = Config.DEEPGRAM_API_KEY is not None
-        tiene_azure = Config.AZURE_SPEECH_KEY is not None and Config.AZURE_SPEECH_REGION is not None
-        
-        if not tiene_deepgram and not tiene_azure:
-            print("\nADVERTENCIA: No hay proveedores configurados")
-            print("Configura DEEPGRAM_API_KEY o AZURE_SPEECH_KEY/AZURE_SPEECH_REGION en .env")
-        
-        app = crear_interfaz()
-        
-        print("\nAplicación lista")
-        print("Abriendo en el navegador...")
-        
-        app.launch(
-            server_name="127.0.0.1",
-            server_port=8080,
-            share=False
-        )
-        
-    except Exception as e:
-        print(f"\nError al iniciar la aplicación: {e}")
+        print("Iniciando aplicacion Gradio...")
+        Config.validar_configuracion("deepgram")
+        interfaz = crear_interfaz()
+        interfaz.launch(server_name="127.0.0.1", server_port=8080, share=False)
+    except Exception as exc:
+        print(f"Error al iniciar la aplicacion: {exc}")
